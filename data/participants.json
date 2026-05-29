@@ -206,5 +206,18 @@
     "tx_hash": "0xd3e53ee5b6ae80c98fee473d6af33cfcd6ac9bf70a335e215c23f54115fc5933",
     "vault_address": "0x92e441cc40655bD2cc98939e1BfF62443C637b5c",
     "paid_at": "2026-05-29T10:32:11.403Z"
+  },
+  {
+    "entry_number": 17,
+    "github_id": 288906167,
+    "github_login": "meowsef",
+    "github_avatar": "https://avatars.githubusercontent.com/u/288906167?v=4",
+    "template_title": "Dice Tower",
+    "app_type": "dice-tower",
+    "pr_number": 28,
+    "pr_url": "https://github.com/gitbankio/autogit-hackathon/pull/28",
+    "tx_hash": null,
+    "vault_address": null,
+    "paid_at": null
   }
 ]
