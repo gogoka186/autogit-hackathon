@@ -1,0 +1,287 @@
+name: Validate, Merge, and Pay
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'templates/**'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  validate-merge-pay:
+    runs-on: ubuntu-latest
+    steps:
+      # Always checkout BASE (main) — never the PR head.
+      # Scripts executed here come from trusted main branch only.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Validate, merge, update list, and pay
+        id: main
+        uses: actions/github-script@v7
+        env:
+          CONTEST_API_SECRET: ${{ secrets.CONTEST_API_SECRET }}
+          CONTEST_API_URL: ${{ secrets.CONTEST_API_URL }}
+        with:
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+            const { execSync } = require('child_process');
+
+            // ── helpers ───────────────────────────────────────────────────
+            async function reject(reason) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: `**Submission rejected.**\n\n${reason}\n\nRead [HACKATHON.md](../blob/main/HACKATHON.md) for submission guidelines.`,
+              });
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                state: 'closed',
+              });
+              core.setFailed(reason);
+            }
+
+            function parseFm(content) {
+              const m = content.match(/^---\n([\s\S]*?)\n---/);
+              if (!m) return null;
+              const fm = {};
+              for (const line of m[1].split('\n')) {
+                const ci = line.indexOf(':');
+                if (ci === -1) continue;
+                fm[line.slice(0, ci).trim()] = line.slice(ci + 1).trim().replace(/^["']|["']$/g, '');
+              }
+              return fm;
+            }
+
+            // ── Step 1: get PR files via GitHub API (no checkout of PR head) ──
+            const { data: prFiles } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            // Reject if any file outside templates/*.md is modified
+            const nonTemplate = prFiles.filter(f => !f.filename.startsWith('templates/') || !f.filename.endsWith('.md'));
+            if (nonTemplate.length > 0) {
+              const names = nonTemplate.map(f => f.filename).join(', ');
+              return await reject(`PR must only add files in \`templates/\`. Unexpected files: \`${names}\``);
+            }
+
+            // Must be exactly one newly ADDED file — modifications to existing templates are not allowed.
+            const tplFiles = prFiles.filter(f => f.status === 'added');
+            if (tplFiles.length === 0) return await reject('No new `.md` file found in `templates/`. Your PR must add a new file, not modify an existing one.');
+            if (tplFiles.length  > 1) return await reject('Only one template file per PR. Submit each in a separate PR.');
+
+            // ── Step 2: fetch template content via blob API ───────────────
+            // This reads only data — no code from the fork is executed.
+            const { data: blob } = await github.rest.git.getBlob({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              file_sha: tplFiles[0].sha,
+            });
+            const content = Buffer.from(blob.content, 'base64').toString('utf-8');
+
+            // ── Step 3: parse + validate frontmatter ──────────────────────
+            const fm = parseFm(content);
+            if (!fm) return await reject('Missing frontmatter block (`---`). Required fields: `title`, `app_type`, `wallet`.');
+            if (!fm.title)    return await reject('Missing frontmatter field: `title`');
+            if (!fm.app_type) return await reject('Missing frontmatter field: `app_type`');
+            if (!fm.wallet)   return await reject('Missing frontmatter field: `wallet`');
+            if (!/^0x[0-9a-fA-F]{40}$/.test(fm.wallet))
+              return await reject('Invalid `wallet` address. Must be `0x` followed by 40 hex chars.');
+            if (fm.wallet === '0x0000000000000000000000000000000000000000')
+              return await reject('Replace the example wallet with your real Base wallet address.');
+
+            // ── Step 4: app_type uniqueness (read from main branch) ───────
+            // scripts/generate-list.js and templates/ here come from trusted main.
+            const templatesDir = path.join(process.env.GITHUB_WORKSPACE, 'templates');
+            let existingTypes = [];
+            try {
+              const existing = fs.readdirSync(templatesDir).filter(f => f.endsWith('.md'));
+              for (const ef of existing) {
+                const efm = parseFm(fs.readFileSync(path.join(templatesDir, ef), 'utf8'));
+                if (efm?.app_type) existingTypes.push(efm.app_type);
+              }
+            } catch {}
+            if (existingTypes.includes(fm.app_type))
+              return await reject(`\`${fm.app_type}\` is already taken. Choose a different app type.`);
+
+            // ── Step 5: read current participants list from main ──────────
+            const dataPath = path.join(process.env.GITHUB_WORKSPACE, 'data', 'participants.json');
+            let participants = [];
+            try { participants = JSON.parse(fs.readFileSync(dataPath, 'utf8')); } catch {}
+
+            if (participants.length >= 100) return await reject('The hackathon is full (100/100). Thank you!');
+
+            const pr       = context.payload.pull_request;
+            const existing = participants.find(p => Number(p.github_id) === Number(pr.user.id));
+            if (existing)
+              return await reject(`Your account already has entry #${existing.entry_number}. One entry per GitHub account.`);
+
+            // ── Step 6: merge PR ──────────────────────────────────────────
+            console.log('Validation passed. Merging PR...');
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              merge_method: 'squash',
+              commit_title: `add template: ${fm.title} (${fm.app_type})`,
+            });
+            console.log('PR merged.');
+
+            // ── Step 7: add pending entry ─────────────────────────────────
+            // Pull latest main (merge just added the template file to main)
+            execSync('git fetch origin main');
+            execSync('git reset --hard origin/main');
+
+            // Re-read participants in case another workflow committed simultaneously
+            try { participants = JSON.parse(fs.readFileSync(dataPath, 'utf8')); } catch { participants = []; }
+
+            const entryNumber = participants.length + 1;
+            participants.push({
+              entry_number:   entryNumber,
+              github_id:      pr.user.id,
+              github_login:   pr.user.login,
+              github_avatar:  pr.user.avatar_url,
+              template_title: fm.title,
+              app_type:       fm.app_type,
+              pr_number:      pr.number,
+              pr_url:         pr.html_url,
+              tx_hash:        null,
+              vault_address:  null,
+              paid_at:        null,
+            });
+            fs.writeFileSync(dataPath, JSON.stringify(participants, null, 2));
+            console.log(`Added pending entry #${entryNumber}.`);
+
+            // Rebuild HTML (scripts/generate-list.js is from trusted main)
+            execSync(`node ${path.join(process.env.GITHUB_WORKSPACE, 'scripts/generate-list.js')}`);
+
+            execSync('git config user.name "gitbankbot"');
+            execSync('git config user.email "285689409+teamgitbank@users.noreply.github.com"');
+            execSync('git add data/participants.json docs/index.html');
+            execSync(`git commit -m "add entry #${entryNumber} (pending) - @${pr.user.login}"`);
+            execSync('git push origin main');
+            console.log('Pushed pending entry.');
+
+            core.setOutput('entry_number', String(entryNumber));
+            core.setOutput('entry_added', 'true');
+
+            // ── Step 8: call payment API ──────────────────────────────────
+            const apiUrl = process.env.CONTEST_API_URL || 'https://gitbank.io/api/contest/pay';
+            console.log(`Calling payment API: ${apiUrl}`);
+
+            let txHash = '', vaultAddress = '', payError = '';
+            try {
+              const res = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Contest-Secret': process.env.CONTEST_API_SECRET,
+                },
+                body: JSON.stringify({
+                  github_id:      pr.user.id,
+                  github_login:   pr.user.login,
+                  wallet:         fm.wallet,
+                  template_title: fm.title,
+                  app_type:       fm.app_type,
+                  pr_number:      pr.number,
+                  pr_url:         pr.html_url,
+                }),
+              });
+              const text = await res.text();
+              if (!res.ok) {
+                console.error(`Payment API error ${res.status}: ${text}`);
+                payError = `${res.status}: ${text.slice(0, 200)}`;
+              } else {
+                const payData = JSON.parse(text);
+                txHash       = payData.txHash       || '';
+                vaultAddress = payData.vaultAddress || '';
+                console.log(`Payment sent. Entry #${payData.entryNumber}, vault: ${vaultAddress}, tx: ${txHash}`);
+              }
+            } catch (err) {
+              console.error(`Payment API call failed: ${err.message}`);
+              payError = err.message;
+            }
+
+            // ── Step 9: update entry with txHash if paid ──────────────────
+            if (txHash) {
+              try {
+                execSync('git fetch origin main');
+                execSync('git reset --hard origin/main');
+                const latest = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+                const idx = latest.findIndex(p => Number(p.entry_number) === entryNumber);
+                if (idx !== -1) {
+                  latest[idx].tx_hash       = txHash;
+                  latest[idx].vault_address = vaultAddress;
+                  latest[idx].paid_at       = new Date().toISOString();
+                  fs.writeFileSync(dataPath, JSON.stringify(latest, null, 2));
+                  execSync(`node ${path.join(process.env.GITHUB_WORKSPACE, 'scripts/generate-list.js')}`);
+                  execSync('git add data/participants.json docs/index.html');
+                  execSync(`git commit -m "mark entry #${entryNumber} paid - @${pr.user.login}"`);
+                  execSync('git push origin main');
+                  console.log('Updated entry with txHash.');
+                }
+              } catch (err) {
+                console.warn('Could not update txHash:', err.message);
+              }
+            }
+
+            core.setOutput('tx_hash', txHash);
+            core.setOutput('vault_address', vaultAddress);
+            core.setOutput('pay_error', payError);
+
+      - name: Comment success on PR
+        if: steps.main.outputs.tx_hash != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const txHash       = `${{ steps.main.outputs.tx_hash }}`;
+            const entryNumber  = `${{ steps.main.outputs.entry_number }}`;
+            const vaultAddress = `${{ steps.main.outputs.vault_address }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: [
+                `**Entry #${entryNumber} accepted. Reward sent.**`,
+                ``,
+                `5 gitUSDC has been deposited into your Gitbank vault on Base.`,
+                ``,
+                `Vault: \`${vaultAddress}\``,
+                `Transaction: https://basescan.org/tx/${txHash}`,
+                ``,
+                `You are now on the [participant list](https://gitbankio.github.io/autogit-hackathon/).`,
+              ].join('\n'),
+            });
+
+      - name: Comment pending on PR
+        if: steps.main.outputs.entry_added == 'true' && steps.main.outputs.tx_hash == ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const entryNumber = `${{ steps.main.outputs.entry_number }}`;
+            const payError    = `${{ steps.main.outputs.pay_error }}`;
+            const errLine     = payError ? `\n\nPayment note: \`${payError.slice(0, 120)}\`` : '';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: [
+                `**Entry #${entryNumber} accepted.**`,
+                ``,
+                `Your template is now on the [participant list](https://gitbankio.github.io/autogit-hackathon/).`,
+                `The 5 gitUSDC reward will be sent to your vault shortly.${errLine}`,
+              ].join('\n'),
+            });
