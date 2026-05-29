@@ -15,12 +15,21 @@ jobs:
   validate-merge-pay:
     runs-on: ubuntu-latest
     steps:
+      # Generate a gitbankbot App token — comments + merges will show as gitbankbot[bot]
+      - name: Generate gitbankbot token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       # Always checkout BASE (main) — never the PR head.
       # Scripts executed here come from trusted main branch only.
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 1
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Validate, merge, update list, and pay
         id: main
@@ -28,7 +37,9 @@ jobs:
         env:
           CONTEST_API_SECRET: ${{ secrets.CONTEST_API_SECRET }}
           CONTEST_API_URL: ${{ secrets.CONTEST_API_URL }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const fs   = require('fs');
             const path = require('path');
@@ -61,6 +72,23 @@ jobs:
                 fm[line.slice(0, ci).trim()] = line.slice(ci + 1).trim().replace(/^["']|["']$/g, '');
               }
               return fm;
+            }
+
+            // ── Resolve bot git identity ──────────────────────────────────
+            // gitbankbot[bot] user is created lazily on first API interaction.
+            // We look it up dynamically so commits are attributed to the bot.
+            let botName  = 'gitbankbot[bot]';
+            let botEmail = 'gitbankbot[bot]@users.noreply.github.com';
+            try {
+              const { data: botUser } = await github.rest.users.getByUsername({
+                username: 'gitbankbot[bot]',
+              });
+              if (botUser?.id) {
+                botEmail = `${botUser.id}+gitbankbot[bot]@users.noreply.github.com`;
+                console.log(`Bot user id: ${botUser.id}, email: ${botEmail}`);
+              }
+            } catch (e) {
+              console.log('Bot user not found yet, using default email.');
             }
 
             // ── Step 1: get PR files via GitHub API (no checkout of PR head) ──
@@ -168,8 +196,8 @@ jobs:
             // Rebuild HTML (scripts/generate-list.js is from trusted main)
             execSync(`node ${path.join(process.env.GITHUB_WORKSPACE, 'scripts/generate-list.js')}`);
 
-            execSync('git config user.name "gitbankbot"');
-            execSync('git config user.email "285689409+teamgitbank@users.noreply.github.com"');
+            execSync(`git config user.name "${botName}"`);
+            execSync(`git config user.email "${botEmail}"`);
             execSync('git add data/participants.json docs/index.html');
             execSync(`git commit -m "add entry #${entryNumber} (pending) - @${pr.user.login}"`);
             execSync('git push origin main');
@@ -246,6 +274,7 @@ jobs:
         if: steps.main.outputs.tx_hash != ''
         uses: actions/github-script@v7
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const txHash       = `${{ steps.main.outputs.tx_hash }}`;
             const entryNumber  = `${{ steps.main.outputs.entry_number }}`;
@@ -270,6 +299,7 @@ jobs:
         if: steps.main.outputs.entry_added == 'true' && steps.main.outputs.tx_hash == ''
         uses: actions/github-script@v7
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const entryNumber = `${{ steps.main.outputs.entry_number }}`;
             const payError    = `${{ steps.main.outputs.pay_error }}`;
