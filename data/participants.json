@@ -99,8 +99,8 @@
     "app_type": "habit-streaks",
     "pr_number": 19,
     "pr_url": "https://github.com/gitbankio/autogit-hackathon/pull/19",
-    "tx_hash": null,
-    "vault_address": null,
-    "paid_at": null
+    "tx_hash": "0xd47f892bcea1d8a290f5cdb1d87784fd9142f602918977be02243982be85d1d7",
+    "vault_address": "0x684c0B2dB0f1adF377d96A9E7343Cbe5020D14F5",
+    "paid_at": "2026-05-29T07:59:34.763Z"
   }
 ]
